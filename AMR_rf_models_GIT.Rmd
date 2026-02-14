@@ -1,0 +1,612 @@
+---
+title: "AMR_rf_models_GIT"
+author: "John Berini"
+date: "2026-02-14"
+output: html_document
+---
+
+bring in our data and load the packages
+```{r setup}
+#packages
+library(MixRF)
+library(randomForest)
+library(caret)
+library(dplyr)#top_n
+library(tidyverse)#rownames_to_column
+library(Hmisc) #rcorr
+library(ranger)
+library(car)#vif function
+library(sp)
+library(sf)
+library(gstat)
+library(ggplot2)
+
+
+amr<-read.csv("data/AMR_2024.12.09.csv", header=T) #need to create a file that keeps the number of lakes at 39 and does not reduce. 
+covs<-read.csv("data/rf_dat.csv", header=T) #create a new covs file that has all 39 lakes found in the amr dataframe
+
+vi<-st_read("gis/vi_outline.shp")#outline of Vancouver Island for clipping spatial data later
+
+
+#regression kriging only works with continuous data, so we will remove those covariates that are non continuous
+covs <- covs[, !names(covs) %in% c("cov_patt", "crwn_clsre")] #these are ordinal
+
+
+```
+
+
+first we need to subset and aggregate the original AMR data, as each lake has three different data points. 
+
+```{r}
+lamr<-amr
+colnames(lamr)[which(names(lamr) == "Lake")] <- "lake_code"
+
+var_list<-names(lamr) %in% c("Samples", "lake_code", "Lake_AMR", "co_occur")
+lamr<-lamr[var_list]
+```
+
+aggregate data to get the means and remove those that have ZEROS remaining
+
+```{r}
+#aggregate the data based on lake code
+lamr_agg<-as.data.frame(aggregate(lamr$Lake_AMR, list(lamr$lake_code), FUN=mean))
+
+#rename columns
+names(lamr_agg)<-c("lake_code", "lake_amr")
+
+#remove the zeroes
+lamr_agg<-lamr_agg[lamr_agg$lake_amr>0,] #remove lake_amr values equal to 0
+lamr_agg <- lamr_agg[complete.cases(lamr_agg), ] #remove NAs
+
+```
+
+Make sure that the lakes are the same in the COVS dataframe and the AMR dataframe and vice versa
+
+```{r}
+unique(lamr_agg$lake_code[!(lamr_agg$lake_code%in%covs$lake_code)]) #list of amr$lake_codes not in covs
+
+lamr_agg<-lamr_agg[lamr_agg$lake_code %in% covs$lake_code,] #remove any lake_codes not in covs$lake_codes
+
+unique(lamr_agg$lake_code[!(lamr_agg$lake_code%in%covs$lake_code)]) #recheck --> should have removed all lake_code in lamr not in covs
+
+unique(covs$lake_code[!(covs$lake_code%in%lamr_agg$lake_code)]) #list of amr$lake_codes not in covs
+
+covs<-covs[covs$lake_code %in% lamr_agg$lake_code,] #remove any ar$lake_codes not in covs$lake_codes
+
+unique(covs$lake_code[!(covs$lake_code%in%lamr_agg$lake_code)])
+```
+
+now we merge the datasets
+
+```{r}
+#merge
+lamr_merge<-merge(x = lamr_agg, y = covs, by = "lake_code")
+
+#remove columns from merged data frame that are not useful. 
+lake_code<-lamr_merge$lake_code
+lake_name<-lamr_merge$lake_name
+longitude<-lamr_merge$longitude
+latitude<-lamr_merge$latitude
+
+#subset lamr_merge to remove those columns not wanted or needed in random forest and model selection
+lamr_merge <- lamr_merge[, -which(names(lamr_merge) %in% c("lake_code", "X", "lake_name", "lake_name.1", "latitude", "longitude"))]
+
+lamr_rf_dat<-lamr_merge
+```
+
+First we need to clean up our covariate data 
+
+```{r}
+length(lamr_rf_dat)
+#select only those covariates that are numeric, omitting names, etc.
+lamr_rf_dat<- lamr_rf_dat %>% select_if(is.numeric)
+length(lamr_rf_dat)
+
+#remove any columns that consist of all zeros
+lamr_rf_dat <- lamr_rf_dat %>% select_if(~ sum(.x, na.rm = TRUE) > 0)
+length(lamr_rf_dat)
+
+#remove covariates with a variance of 0
+lamr_rf_dat <- lamr_rf_dat %>% select_if(~ sd(.x) != 0)
+length(lamr_rf_dat)
+
+#create a separate object for lake_amr and all other data for the boruta algorithm
+lake_amr<-lamr_rf_dat$lake_amr
+rf_dat <- lamr_rf_dat[, -which(names(lamr_rf_dat) %in% c("lake_amr"))]
+```
+
+Below we are using the ranger function implement random forest for variable selection. However, because random forest has randomness as an inherent part of the process, different runs of the same process can lead to a different set of variables. To alleviate this, we are looping over 100 iterations of the ranger process and pulling out those covariates that have the highest mean importance. 
+
+```{r}
+# Sub-function: remove collinear predictors based on importance from ranger
+remove_collinear_by_importance <- function(data, response, cutoff = 0.7, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+
+  full_data <- data.frame(response = response, data)
+
+  rf_model <- ranger(response ~ ., data = full_data, importance = "permutation")
+  importance_scores <- rf_model$variable.importance
+
+  data_num <- data[, sapply(data, is.numeric)]
+  cor_matrix <- cor(data_num, use = "pairwise.complete.obs")
+
+  to_remove <- c()
+
+  repeat {
+    high_corr_pairs <- which(abs(cor_matrix) > cutoff & upper.tri(cor_matrix), arr.ind = TRUE)
+    if (nrow(high_corr_pairs) == 0) break
+
+    var1 <- colnames(cor_matrix)[high_corr_pairs[1, 1]]
+    var2 <- colnames(cor_matrix)[high_corr_pairs[1, 2]]
+
+    imp1 <- importance_scores[var1]; if (is.null(imp1)) imp1 <- -Inf
+    imp2 <- importance_scores[var2]; if (is.null(imp2)) imp2 <- -Inf
+
+    remove_var <- if (imp1 >= imp2) var2 else var1
+    to_remove <- c(to_remove, remove_var)
+
+    cor_matrix <- cor_matrix[!(rownames(cor_matrix) == remove_var), !(colnames(cor_matrix) == remove_var)]
+    importance_scores <- importance_scores[!(names(importance_scores) == remove_var)]
+  }
+
+  cleaned_data <- data[, !(names(data) %in% to_remove)]
+  return(cleaned_data)
+}
+
+# Wrapper: repeat the above function n_iter times and retain stable predictors
+remove_collinear_by_stability <- function(data, response, cutoff = 0.7, n_iter = 1000, threshold = 0.9, seed = 42) {
+  set.seed(seed)
+  seeds <- sample(1e6, n_iter)
+
+  retained_list <- vector("list", n_iter)
+  pb <- txtProgressBar(min = 0, max = n_iter, style = 3)
+
+  for (i in seq_len(n_iter)) {
+    cleaned <- remove_collinear_by_importance(data, response, cutoff, seed = seeds[i])
+    retained_list[[i]] <- names(cleaned)
+    setTxtProgressBar(pb, i)
+  }
+
+  close(pb)
+
+  # Tabulate how often each variable was retained
+  all_vars <- unlist(retained_list)
+  var_freq <- table(all_vars) / n_iter
+
+  # Keep only variables that were retained in at least 'threshold' proportion of runs
+  stable_vars <- names(var_freq[var_freq >= threshold])
+
+  cat("\nFinal retained variables (stability ≥", threshold, "):\n")
+  print(stable_vars)
+
+  # Return stable variable subset of the original data
+  return(list(
+    data = data[, stable_vars, drop = FALSE],
+    retained_vars = stable_vars,
+    retention_frequency = var_freq
+  ))
+}
+
+#run custom function above
+noncollinear_covs <- remove_collinear_by_stability(rf_dat, lake_amr, cutoff = 0.7, n_iter = 1000, threshold = 0.9, seed = 123)
+
+#subset rf_dat to create a new dataset that contains only those important covariates 
+clean_rf_dat <- rf_dat[, noncollinear_covs$retained_vars]
+
+#=====================================================================================
+#above we used ranger to establish covariate importance and used that to determine which covariates to keep. Here, we will use ranger to evaluate which covaraites are most important in AMR prediction.
+#Looping ranger for stable variable selection:
+n_runs <- 1000
+top_k <- 20
+top_vars_list <- list()
+
+for (i in 1:n_runs) {
+ set.seed(i)  # set seed for reproducibility
+
+ rf <- ranger(
+   formula = lake_amr ~ .,
+   data = clean_rf_dat,
+   importance = "permutation",  # better for variable selection
+   num.trees = 1000
+ )
+
+ # Get variable importance and extract top variables
+ importance_df <- data.frame(variable = names(rf$variable.importance),
+                             importance = rf$variable.importance) %>%
+   arrange(desc(importance)) %>%
+   slice_head(n = top_k)
+
+ top_vars_list[[i]] <- importance_df$variable
+}
+
+# Combine all selected variables into a single vector
+all_top_vars <- unlist(top_vars_list)
+
+# Count how often each variable was selected
+variable_freq <- sort(table(all_top_vars), decreasing = TRUE)
+
+# View the most stable variables
+head(variable_freq, 20)
+
+# create list of important covariates
+important_covariates<-names(head(variable_freq, 20))
+
+# extract data for important covariates from our rf_dat
+important_predictors <- rf_dat[, important_covariates]
+
+```
+
+Now we can use the step function to find our best fitting model
+
+```{r}
+#Use step function to find best fitting model from ranger function
+  full_AMR_model_rngr <- lm(lake_amr~.,data=important_predictors)
+  #use the step function to perform both forward and backward selection
+  step_AMR_model_rngr <- step(full_AMR_model_rngr, direction = "both") #performs both backward and forward selection 
+  summary_step_AMR_rngr<-summary(step_AMR_model_rngr) #creates an object of the summary statistics
+  summary(full_AMR_model_rngr)
+  
+ranger_fit<-step_AMR_model_rngr
+summary(ranger_fit)
+```
+
+
+Now that we have our best fitting model,we can begin the process of regression kriging.
+
+First we'll install some packages. 
+
+```{r}
+library(gstat)
+library(terra)
+library(sp)
+library(sf)
+library(raster)
+```
+
+Now we need to read in our spatial data, based in our best fitting model. 
+Note that data are too large to be hosted on GitHUB and are hosted on a local network folder. 
+
+```{r}
+#best fitting model based on ranger and step functions
+summary(ranger_fit)
+
+#make sure to attached the courses drive @ Carleton
+#landscape covariates
+d2_lake<-rast("tiff/d2_lake.tif")
+
+d2_ancient<-rast("/tiff/d2_ancient.tif")
+
+spp3_cvr<-rast("tiff/spp3_cvr.tif")
+
+#climatic covariates
+mean_NFFD09<-rast("tiff/BC/800m/Normal_1991_2020/NFFD09.tif")
+
+```
+
+check the raster coordinate systems and make sure they are all the same extent and resolution
+
+```{r}
+#coordinate systems
+crs(d2_lake)
+crs(d2_ancient)
+crs(spp3_cvr)
+crs(mean_NFFD09)
+
+#check resolution and resample if necessary. Resampling to the coarsest raster to save time/computational resources
+res(d2_lake)
+d2_lake <- resample(d2_lake, mean_NFFD09, method = "bilinear")
+
+res(d2_ancient)
+d2_ancient <- resample(d2_ancient, mean_NFFD09, method = "bilinear")
+
+res(spp3_cvr)
+spp3_cvr <- resample(spp3_cvr, mean_NFFD09, method = "bilinear")
+
+res(mean_NFFD09)
+
+#now we just need to check our extents
+ext(d2_lake)
+ext(d2_ancient)
+ext(spp3_cvr)
+ext(mean_NFFD09)
+
+#check names
+names(d2_lake)
+names(d2_ancient)
+names(spp3_cvr)
+names(mean_NFFD09)
+
+```
+
+Calculate residuals and compute a variogram
+
+```{r}
+#estimate our residuals for our best fitting model
+rf_dat$residuals<-residuals(ranger_fit)
+
+#replace locational and identification infomration for each lake
+rf_dat$lake_code<-lake_code
+rf_dat$lake_name<-lake_name
+
+# Create a SpatialPointsDataFrame from rf_dat
+coordinates(rf_dat) <- ~longitude + latitude
+
+# Assign the CRS from your raster (converted to PROJ.4 format)
+proj4string(rf_dat) <- crs(d2_lake, proj = TRUE)
+
+#subset rf_dat to contain only important_covariates
+rf_dat <- rf_dat[, c("d2_lake", "d2_ancient", "spp3_cvr", "mean_NFFD09", "residuals")]
+
+# Create experimental variogram of residuals
+vgram <- variogram(residuals ~ 1, rf_dat)
+
+# Fit variogram model
+vgram_model <- fit.variogram(vgram, model = vgm("Sph"))  # or try "Exp", "Gau", etc.
+plot(vgram, vgram_model)
+
+```
+
+create an empty grid based on my current rasters
+
+```{r}
+# --- Create an empty grid that matches your covariate raster ---
+
+# Get the resolution/extent/CRS from your base raster
+raster_ext <- ext(d2_lake)
+raster_res <- res(d2_lake)
+raster_crs <- crs(d2_lake)
+
+# Make an empty raster template
+empty_grid <- rast(raster_ext, resolution = raster_res, crs = raster_crs)
+
+# --- Convert raster grid to prediction locations for kriging ---
+
+# Extract coordinates for every cell
+coords <- xyFromCell(empty_grid, 1:ncell(empty_grid))
+
+# Build a SpatialPixelsDataFrame (preferred input for gstat::krige)
+pred_df <- data.frame(x = coords[,1], y = coords[,2])
+coordinates(pred_df) <- ~x+y
+gridded(pred_df) <- TRUE
+proj4string(pred_df) <- CRS(as.character(raster_crs))
+
+```
+
+Now that we have an empty grid within with to predict our kriged values, we can perform kriging of our residuals
+
+```{r}
+#1.	Stack your predictor rasters:
+preds_stack <- c(d2_lake, d2_ancient, spp3_cvr, mean_NFFD09)
+names(preds_stack) <- c("d2_lake", "d2_ancient", "spp3_cvr", "mean_NFFD09")
+
+#2.	Predict regression surface across the raster stack:
+reg_preds_raster <- predict(preds_stack, ranger_fit)  # terra handles rasters natively
+
+#3.	Create a prediction grid for residual kriging:
+# Use the same raster as template
+empty_grid <- preds_stack[[1]]  # pick any layer as template
+
+# Convert to SpatialPixelsDataFrame for gstat
+coords <- xyFromCell(empty_grid, 1:ncell(empty_grid))
+pred_df <- data.frame(x = coords[,1], y = coords[,2])
+coordinates(pred_df) <- ~x+y
+gridded(pred_df) <- TRUE
+proj4string(pred_df) <- CRS(as.character(crs(empty_grid)))
+
+#4.	Kriging residuals on that grid:
+# Compute residuals
+residuals <- lake_amr - predict(ranger_fit, newdata = rf_dat)
+
+# Add residuals as a new column in your SpatialPointsDataFrame
+rf_dat$resid <- residuals
+
+# Now rf_dat is ready for kriging
+res_kriged <- krige(resid ~ 1, rf_dat, pred_df, model = vgram_model,
+                    nmax = Inf, maxdist = Inf)
+
+#5.	Combine regression and kriging surfaces:
+# Convert reg_preds_raster to vector to align with kriged
+reg_vals <- values(reg_preds_raster)
+
+# Regression + residuals
+combined_vals <- reg_vals + res_kriged$var1.pred
+
+# Put back into a raster
+reg_kriged_raster <- empty_grid
+values(reg_kriged_raster) <- combined_vals
+
+reg_kriged_raster <- mask(reg_kriged_raster, vi)
+plot(reg_kriged_raster)
+
+# Plot
+plot(reg_kriged_raster,
+     xlim = c(-129, -123),  # xmin, xmax
+     ylim = c(48, 51),    # ymin, ymax
+     main = "Regression-Kriging Raster (Zoomed In)")
+```
+
+Now that we've completed our kriging of the regression residuals and used our best fitting model to predict AMR values, we need to export these data as a raster. 
+
+```{r}
+library(terra)
+
+# Define output path
+out_file <- "R_out/gis/regression_kriging_result.tif"
+
+# Write the raster
+writeRaster(reg_kriged_raster,
+            filename = out_file,
+            overwrite = TRUE)   # overwrite if needed
+```
+
+Now that we have out best fitting model and it is converted to a raster, we want to perform spatial hold-one out (a.k.a.- leave one out cross validation). 
+
+```{r}
+###############################################################################
+# Spatial Leave-One-Out Cross-Validation (LOOCV) for Regression-Kriging
+###############################################################################
+
+# -----------------------------
+# 1. Prepare
+# -----------------------------
+
+rf_dat@data$lake_amr <- lake_amr
+
+# Name of response column
+response_col <- "lake_amr"
+
+# Ensure response column is in @data
+if (!response_col %in% names(rf_dat@data)) {
+  rf_dat@data[[response_col]] <- rf_dat[[response_col]]
+}
+
+# Predictor columns are all columns in @data except the response
+predictor_cols <- setdiff(names(rf_dat@data), response_col)
+
+# Check there is at least one predictor
+if (length(predictor_cols) == 0) {
+  stop("No predictor columns found! Cannot fit random forest.")
+}
+
+n_points <- nrow(rf_dat)
+predictions <- numeric(n_points)  # store LOOCV predictions
+
+
+# -----------------------------
+# 2. Spatial LOOCV loop
+# -----------------------------
+for (i in 1:n_points) {
+  
+  cat("Processing point", i, "of", n_points, "\n")
+  
+  # 2a. Split data
+  train_data <- rf_dat[-i, ]
+  test_data  <- rf_dat[i, , drop = FALSE]
+  
+  # 2b. Prepare training and test data frames for RF
+  rf_train_df <- data.frame(train_data@data[, predictor_cols, drop = FALSE],
+                            lake_amr = train_data@data[, response_col])
+  rf_test_df <- data.frame(test_data@data[, predictor_cols, drop = FALSE])
+  
+  # 2c. Fit RF on training data
+  rf_fit <- ranger(lake_amr ~ ., data = rf_train_df)
+  
+  # 2d. Compute residuals on training data
+  train_resid <- train_data@data[, response_col] - predict(rf_fit, data = rf_train_df)$predictions
+  train_data$resid <- train_resid
+  
+  # 2e. Fit variogram on residuals
+  vgm_model <- variogram(resid ~ 1, train_data)
+  vgm_fit   <- fit.variogram(vgm_model, model = vgm("Sph"))
+  
+  # 2f. Krige residual to held-out point
+  res_kriged <- krige(resid ~ 1, train_data, test_data, model = vgm_fit)
+  
+  # 2g. Predict regression value for held-out point
+  rf_pred <- predict(rf_fit, data = rf_test_df)$predictions
+  
+  # 2h. Combine regression + kriged residual
+  predictions[i] <- rf_pred + res_kriged$var1.pred
+}
+
+# -----------------------------
+# 3. Evaluate performance
+# -----------------------------
+observed <- rf_dat@data[, response_col]
+rmse <- sqrt(mean((predictions - observed)^2))
+correlation <- cor(predictions, observed)
+
+cat("LOOCV RMSE:", rmse, "\n")
+cat("LOOCV correlation:", correlation, "\n")
+
+# -----------------------------
+# 4. Store results
+# -----------------------------
+rf_dat$LOOCV_pred <- predictions
+```
+
+Now we can make some diagnostic plots to show how well out model is working. 
+
+```{r}
+###############################################################################
+# Spatial LOOCV Diagnostic Plots
+###############################################################################
+
+# Extract observed and predicted values
+observed <- rf_dat@data$lake_amr
+predicted <- rf_dat$LOOCV_pred
+residuals <- predicted - observed
+
+# 1. Observed vs Predicted
+p1 <- ggplot(data = data.frame(observed, predicted), aes(x = observed, y = predicted)) +
+  geom_point(color = "blue", alpha = 0.7) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed", size = 1.2) +
+  labs(x = "Observed lake_amr", y = "Predicted (LOOCV)",
+       title = "a)") +
+  theme_minimal()
+print(p1)
+
+# Add RMSE and correlation as text
+rmse <- sqrt(mean(residuals^2))
+correlation <- cor(predicted, observed)
+p1 <- p1 + annotate("text", x = min(observed), y = max(predicted),
+                    label = paste0("RMSE = ", round(rmse,2), "\nR = ", round(correlation,2)),
+                    hjust = 0, vjust = 1, size = 4)
+
+# 2. Residuals vs Predicted
+p2 <- ggplot(data = data.frame(predicted, residuals), aes(x = predicted, y = residuals)) +
+  geom_point(color = "darkgreen", alpha = 0.7) +
+  geom_hline(yintercept = 0, color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Predicted lake_amr", y = "Residuals",
+       title = "b)") +
+  theme_minimal()
+print(p2)
+
+# 3. Histogram of residuals
+p3 <- ggplot(data = data.frame(residuals), aes(x = residuals)) +
+  geom_histogram(bins = 15, fill = "lightgray", color = "black") +
+  labs(x = "Residuals", y = "Count",
+       title = "c)") +
+  theme_minimal()
+print(p3)
+
+# 4. Spatial plot of residuals
+# Extract coordinates and residuals
+predicted <- rf_dat$LOOCV_pred
+observed <- rf_dat@data$lake_amr
+residuals <- predicted - observed
+
+# Combine coordinates + residuals into a single data frame
+resid_df <- data.frame(
+  x = rf_dat@coords[,1],
+  y = rf_dat@coords[,2],
+  residuals = residuals
+)
+
+# Check if vi is sf or sp
+if (inherits(vi, "sf")) {
+  vi_sf <- vi
+} else if (inherits(vi, "Spatial")) {
+  vi_sf <- st_as_sf(vi)  # convert sp to sf
+} else {
+  stop("vi must be an sf or Spatial object")
+}
+
+# Plot spatial residuals with Vancouver Island outline
+p4 <- ggplot() +
+  geom_point(data = resid_df, aes(x = x, y = y, color = residuals), size = 2) +
+  geom_sf(data = vi_sf, fill = NA, color = "black", size = 0.8) +  # outline
+  scale_color_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  labs(color = "Residuals", title = "d)") +
+  theme_minimal() +
+  coord_sf()  # ensures correct aspect ratio for spatial data
+
+print(p4)
+
+library(patchwork)
+
+# Arrange plots
+(p1 | p2) / (p3 | p4)
+
+```
+
