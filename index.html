@@ -1,0 +1,971 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Trout Home Range Editor</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #f0ece0;
+    font-family: Georgia, serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 12px;
+    min-height: 100dvh;
+    overflow-x: hidden;
+    -webkit-text-size-adjust: 100%;
+  }
+  h1 {
+    font-size: clamp(0.8rem, 2.5vw, 1rem);
+    font-style: italic;
+    color: #3a2a10;
+    margin-bottom: 8px;
+    letter-spacing: 0.05em;
+    text-align: center;
+  }
+  #controls {
+    display: flex; gap: 6px; flex-wrap: wrap; justify-content: center;
+    margin-bottom: 8px; align-items: center;
+    width: 100%; max-width: 820px;
+  }
+  .btn {
+    padding: 6px 12px;
+    background: #e8dfc8;
+    border: 1px solid #8a7a5a;
+    color: #3a2a10;
+    cursor: pointer;
+    font-family: Georgia, serif;
+    font-size: clamp(0.65rem, 2vw, 0.75rem);
+    border-radius: 2px;
+    transition: all 0.15s;
+    touch-action: manipulation;
+    min-height: 36px;
+  }
+  .btn:hover { background: #d8cfa8; }
+  .btn.active { background: #c8b880; border-color: #5a4a20; font-weight: bold; }
+  .fish-selector { display: flex; gap: 5px; }
+  .fish-btn {
+    width: 36px; height: 36px; border-radius: 50%;
+    border: 2px solid #8a7a5a;
+    cursor: pointer; font-size: 0.72rem;
+    font-family: Georgia, serif; font-weight: bold; color: #fff;
+    transition: all 0.2s;
+    touch-action: manipulation;
+  }
+  .fish-btn.selected { border-color: #2a1a00; transform: scale(1.2); box-shadow: 0 0 0 2px #fff; }
+  #canvas-outer {
+    width: 100%;
+    max-width: 820px;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    border: 1px solid #8a7a5a;
+    box-shadow: 3px 3px 12px rgba(0,0,0,0.25);
+    background: #f5f0e0;
+  }
+  #canvas-wrapper {
+    position: relative;
+    width: 760px;
+  }
+  canvas { display: block; touch-action: pan-y; }
+  #info {
+    margin-top: 8px; font-size: clamp(0.6rem, 1.8vw, 0.68rem); color: #5a4a30;
+    font-style: italic; text-align: center; max-width: 820px; padding: 0 8px;
+  }
+  #mode-label { font-size: clamp(0.65rem, 2vw, 0.75rem); color: #5a3a10; font-weight: bold; font-family: Georgia; }
+  #btn-lock { min-width: 110px; }
+  #btn-lock.locked { background: #c8d8b0; border-color: #4a6a30; color: #2a4a10; font-weight: bold; }
+  #legend {
+    position: absolute;
+    top: 10px; left: 10px;
+    background: rgba(248,240,218,0.94);
+    border: 1px solid #8a7a5a;
+    padding: 8px 10px 10px 10px;
+    width: 148px;
+    cursor: grab;
+    user-select: none;
+    -webkit-user-select: none;
+    box-shadow: 2px 2px 6px rgba(0,0,0,0.18);
+    font-family: Georgia, serif;
+    z-index: 10;
+    touch-action: none;
+  }
+  #legend:active { cursor: grabbing; }
+  #legend-title { font-size: 9px; font-weight: bold; color: #3a2a10; margin-bottom: 4px; letter-spacing: 0.04em; }
+  #legend-subtitle { font-size: 8px; color: #5a4a30; margin-bottom: 2px; }
+  .legend-fish { display: flex; align-items: center; gap: 7px; font-size: 9px; color: #3a2a10; margin-top: 4px; }
+  .legend-fish.selected { font-weight: bold; }
+  .legend-swatch { width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; border: 1.5px solid transparent; }
+  .legend-fish.selected .legend-swatch { border-color: #3a2a10; }
+  #legend-flow { font-size: 9px; font-style: italic; color: #3a6a8a; margin-top: 6px; }
+  #legend-drag-hint { font-size: 7.5px; color: #8a7a5a; margin-top: 5px; text-align: center; }
+</style>
+</head>
+<body>
+<h1>Trout Movement &amp; Home Range — Interactive Editor</h1>
+<div id="controls">
+  <span id="mode-label">ADD POINT</span>
+  <div class="fish-selector" id="fish-selector"></div>
+  <button class="btn active" id="btn-add" onclick="setMode('add')" style="opacity:0.4;pointer-events:none">Add Point</button>
+  <button class="btn" id="btn-move" onclick="setMode('move')" style="opacity:0.4;pointer-events:none">Move Point</button>
+  <button class="btn" id="btn-delete" onclick="setMode('delete')" style="opacity:0.4;pointer-events:none">Delete Point</button>
+  <button class="btn active" id="btn-hull" onclick="toggleHull()">Home Range</button>
+  <button class="btn" onclick="resetFish()">Reset Fish</button>
+  <button class="btn" onclick="exportData()">Export JSON</button>
+  <button class="btn locked" id="btn-lock" onclick="toggleLock()">🔒 Editing Off</button>
+</div>
+<div id="canvas-outer">
+  <div id="canvas-wrapper">
+    <canvas id="c"></canvas>
+    <div id="legend">
+      <div id="legend-title">TROUT HOME RANGES</div>
+      <div id="legend-subtitle">● Points &nbsp;— Connections</div>
+      <div id="legend-subtitle">╌ Convex Hull</div>
+      <div id="legend-fish-list"></div>
+      <div id="legend-flow">↓ current flow</div>
+      <div id="legend-drag-hint">✥ drag to move</div>
+    </div>
+  </div>
+</div>
+<div id="info">Click to add points to selected fish's home range cloud · Move mode: drag points · Lines connect all points within each cloud</div>
+
+<script>
+const W = 760, H = 900;
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+canvas.width = W; canvas.height = H;
+
+// Fish species colors — warm naturalistic palette
+const FISH = [
+  { name: 'Trout 1', main: '#b8460a', light: '#e8905a', label: 'T1' },
+  { name: 'Trout 2', main: '#2a7a3a', light: '#70c080', label: 'T2' },
+  { name: 'Trout 3', main: '#1a5a9a', light: '#60a0d0', label: 'T3' },
+  { name: 'Trout 4', main: '#8a3a8a', light: '#c07ac0', label: 'T4' },
+  { name: 'Trout 5', main: '#7a6a10', light: '#c0a840', label: 'T5' },
+];
+
+// Stream centerline control points (diagonal, meandering top-left → bottom-right)
+const STREAM_CL = [
+  {x:80,  y:30},
+  {x:160, y:80},
+  {x:200, y:160},
+  {x:170, y:250},
+  {x:200, y:330},
+  {x:260, y:390},
+  {x:330, y:430},
+  {x:380, y:510},
+  {x:360, y:600},
+  {x:390, y:670},
+  {x:450, y:720},
+  {x:530, y:760},
+  {x:600, y:820},
+  {x:660, y:880},
+];
+
+// Stream width varies along path
+const STREAM_W = [38, 42, 48, 44, 46, 52, 56, 50, 48, 52, 58, 60, 56, 52];
+
+// 5 fish home range clouds, distributed along stream (roughly at positions 1-2, 3, 5, 7-8, 10-11)
+// Each fish cluster will be centered near the stream at those positions
+let fishClouds = [[], [], [], [], []];
+
+function catmullRomPoint(pts, t) {
+  // t in [0, pts.length-1]
+  const n = pts.length;
+  const i = Math.min(Math.floor(t), n - 2);
+  const u = t - i;
+  const p0 = pts[Math.max(i - 1, 0)];
+  const p1 = pts[i];
+  const p2 = pts[Math.min(i + 1, n - 1)];
+  const p3 = pts[Math.min(i + 2, n - 1)];
+  return {
+    x: 0.5*((2*p1.x)+(-p0.x+p2.x)*u+(2*p0.x-5*p1.x+4*p2.x-p3.x)*u*u+(-p0.x+3*p1.x-3*p2.x+p3.x)*u*u*u),
+    y: 0.5*((2*p1.y)+(-p0.y+p2.y)*u+(2*p0.y-5*p1.y+4*p2.y-p3.y)*u*u+(-p0.y+3*p1.y-3*p2.y+p3.y)*u*u*u),
+  };
+}
+
+// Find the closest point ON the stream centerline to (px,py)
+// Returns {x,y} clamped inside the water channel
+function clampToStream(px, py) {
+  let bestDist = Infinity, bestIdx = 0;
+  for (let i = 0; i < STREAM_SAMPLES.length; i++) {
+    const s = STREAM_SAMPLES[i];
+    const d = (s.pt.x - px)**2 + (s.pt.y - py)**2;
+    if (d < bestDist) { bestDist = d; bestIdx = i; }
+  }
+  const samp = STREAM_SAMPLES[bestIdx];
+  const norm = getNormal(STREAM_SAMPLES, bestIdx);
+  const sw = streamWidthAt(samp.t) * 0.85; // stay 85% of half-width in from edge
+  // Project point onto the normal axis
+  const dx = px - samp.pt.x, dy = py - samp.pt.y;
+  const proj = dx * norm.nx + dy * norm.ny;
+  const clampedProj = Math.max(-sw, Math.min(sw, proj));
+  return {
+    x: Math.round(samp.pt.x + norm.nx * clampedProj),
+    y: Math.round(samp.pt.y + norm.ny * clampedProj),
+  };
+}
+
+// Get stream width at parameter t
+function streamWidthAt(t) {
+  const n = STREAM_W.length;
+  const i = Math.min(Math.floor(t), n - 2);
+  const u = t - i;
+  return STREAM_W[i] * (1 - u) + STREAM_W[Math.min(i+1,n-1)] * u;
+}
+
+// Build sampled stream path
+function buildStreamSamples(steps = 200) {
+  const pts = [];
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps * (STREAM_CL.length - 1);
+    pts.push({ pt: catmullRomPoint(STREAM_CL, t), t: t });
+  }
+  return pts;
+}
+const STREAM_SAMPLES = buildStreamSamples();
+
+// Get perpendicular normal at sample index
+function getNormal(samples, idx) {
+  const a = samples[Math.max(idx-1,0)].pt;
+  const b = samples[Math.min(idx+1,samples.length-1)].pt;
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const len = Math.sqrt(dx*dx+dy*dy) || 1;
+  return { nx: -dy/len, ny: dx/len };
+}
+
+// Generate home range cloud for fish i centered at parameter t along stream
+function generateCloud(streamT, numPts=25) {
+  const cIdx = Math.round(streamT / (STREAM_CL.length - 1) * (STREAM_SAMPLES.length - 1));
+  const center = STREAM_SAMPLES[Math.min(cIdx, STREAM_SAMPLES.length-1)].pt;
+  const sw = streamWidthAt(streamT);
+  const pts = [];
+  // Spread: mostly along stream (longitudinal), less across
+  for (let i = 0; i < numPts; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const rLong = (0.3 + Math.random() * 0.7) * sw * 2.5; // along stream
+    const rCross = (0.1 + Math.random() * 0.9) * sw * 0.85; // across stream
+    // Get stream tangent direction
+    const norm = getNormal(STREAM_SAMPLES, Math.min(cIdx, STREAM_SAMPLES.length-1));
+    // tangent perpendicular to normal
+    const tx = norm.ny, ty = -norm.nx;
+    const nx = norm.nx, ny = norm.ny;
+    const rawX = center.x + tx * (Math.random()-0.5) * rLong * 2 + nx * (Math.random()-0.5) * rCross * 2;
+    const rawY = center.y + ty * (Math.random()-0.5) * rLong * 2 + ny * (Math.random()-0.5) * rCross * 2;
+    pts.push(clampToStream(rawX, rawY));
+  }
+  return pts;
+}
+
+// Fish cloud center positions along stream (parameter t values, 0 = top, 12 = bottom)
+const FISH_T = [1.2, 3.2, 5.4, 7.8, 10.5];
+
+// Generate Fish 4's "passing through" cloud: elongated, sparse, straddling sites 3 & 5
+function generateTransitCloud() {
+  // Fish 4 ranges from ~t=5.8 (overlapping Fish 3) down to ~t=11.0 (overlapping Fish 5)
+  // Sparse points spread longitudinally along this whole stretch
+  const tMin = 5.8, tMax = 11.2;
+  const numPts = 20;
+  const pts = [];
+  for (let i = 0; i < numPts; i++) {
+    // Spread evenly along the transit corridor with small random jitter
+    const t = tMin + (tMax - tMin) * (i / (numPts - 1)) + (Math.random() - 0.5) * 0.6;
+    const tClamped = Math.max(0, Math.min(STREAM_CL.length - 1, t));
+    const cIdx = Math.round(tClamped / (STREAM_CL.length - 1) * (STREAM_SAMPLES.length - 1));
+    const center = STREAM_SAMPLES[Math.min(cIdx, STREAM_SAMPLES.length - 1)].pt;
+    const norm = getNormal(STREAM_SAMPLES, Math.min(cIdx, STREAM_SAMPLES.length - 1));
+    const tx = norm.ny, ty = -norm.nx;
+    const nx = norm.nx, ny = norm.ny;
+    const sw = streamWidthAt(tClamped);
+    // Narrow cross-stream spread (stays in channel), small longitudinal jitter
+    const rawX2 = center.x + tx * (Math.random() - 0.5) * sw * 0.8 + nx * (Math.random() - 0.5) * sw * 0.6;
+    const rawY2 = center.y + ty * (Math.random() - 0.5) * sw * 0.8 + ny * (Math.random() - 0.5) * sw * 0.6;
+    pts.push(clampToStream(rawX2, rawY2));
+  }
+  return pts;
+}
+
+function initClouds() {
+  for (let i = 0; i < 5; i++) {
+    if (i === 3) {
+      fishClouds[3] = generateTransitCloud();
+    } else {
+      fishClouds[i] = generateCloud(FISH_T[i], 24);
+    }
+  }
+}
+initClouds();
+
+// Build fish selector buttons
+const sel = document.getElementById('fish-selector');
+FISH.forEach((f, i) => {
+  const btn = document.createElement('button');
+  btn.className = 'fish-btn' + (i===0?' selected':'');
+  btn.style.background = f.main;
+  btn.title = f.name;
+  btn.textContent = i+1;
+  btn.onclick = () => selectFish(i);
+  sel.appendChild(btn);
+});
+
+let selectedFish = 0;
+let mode = 'add';
+let showHull = true;
+let dragging = null;
+let locked = true;
+
+function selectFish(i) {
+  selectedFish = i;
+  document.querySelectorAll('.fish-btn').forEach((b,idx) => b.classList.toggle('selected', idx===i));
+  render();
+}
+
+function setMode(m) {
+  mode = m;
+  ['add','move','delete'].forEach(mm => {
+    const b = document.getElementById('btn-'+mm);
+    if(b) b.classList.toggle('active', mm===m);
+  });
+  document.getElementById('mode-label').textContent = m === 'add' ? 'ADD POINT' : m === 'move' ? 'MOVE POINT' : 'DELETE POINT';
+  canvas.style.cursor = m==='delete'?'not-allowed': m==='move'?'grab':'crosshair';
+}
+
+function toggleHull() {
+  showHull = !showHull;
+  document.getElementById('btn-hull').classList.toggle('active', showHull);
+  render();
+}
+function resetFish() {
+  if (confirm(`Reset ${FISH[selectedFish].name}?`)) {
+    fishClouds[selectedFish] = generateCloud(FISH_T[selectedFish], 24);
+    render();
+  }
+}
+
+function toggleLock() {
+  locked = !locked;
+  const btn = document.getElementById('btn-lock');
+  btn.textContent = locked ? '🔒 Editing Off' : '🔓 Editing On';
+  btn.classList.toggle('locked', locked);
+  // Disable/grey out editing controls visually
+  ['btn-add','btn-move','btn-delete'].forEach(id => {
+    document.getElementById(id).style.opacity = locked ? '0.4' : '1';
+    document.getElementById(id).style.pointerEvents = locked ? 'none' : '';
+  });
+  document.querySelectorAll('.fish-btn').forEach(b => {
+    b.style.opacity = locked ? '0.5' : '1';
+  });
+  canvas.style.cursor = locked ? 'default' : (mode === 'move' ? 'grab' : mode === 'delete' ? 'not-allowed' : 'crosshair');
+}
+
+// ---------- DRAWING ----------
+
+// Parchment / map background
+function drawBackground() {
+  const g = ctx.createLinearGradient(0,0,W,H);
+  g.addColorStop(0, '#f5f0e0');
+  g.addColorStop(0.5, '#ede5c8');
+  g.addColorStop(1, '#e8e0c8');
+  ctx.fillStyle = g;
+  ctx.fillRect(0,0,W,H);
+
+  // Grain texture
+  ctx.globalAlpha = 0.04;
+  for (let i = 0; i < 3000; i++) {
+    ctx.fillStyle = Math.random() > 0.5 ? '#8a7a50' : '#fff';
+    ctx.fillRect(Math.random()*W, Math.random()*H, 1, 1);
+  }
+  ctx.globalAlpha = 1;
+}
+
+// Seeded PRNG
+function mkRng(seed) {
+  let s = seed >>> 0;
+  return () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 0x100000000; };
+}
+
+// Draw a conifer / pine tree at (x,y)
+function drawTree(x, y, size, rng) {
+  if (x < -30 || x > W+30 || y < -30 || y > H+30) return;
+  const h = size * 2.2;
+  const layers = 3;
+  // Trunk
+  ctx.fillStyle = '#6b4a28';
+  ctx.fillRect(x - size*0.12, y, size*0.24, size*0.55);
+  // Layered canopy (bottom to top)
+  for (let l = 0; l < layers; l++) {
+    const ly = y - l * (h / layers) * 0.55;
+    const lw = size * (1.1 - l * 0.28);
+    const lh = (h / layers) * 0.75;
+    const shade = l === 0 ? '#2d6020' : l === 1 ? '#3a7828' : '#4a8a32';
+    ctx.beginPath();
+    ctx.moveTo(x, ly - lh);
+    ctx.lineTo(x - lw, ly);
+    ctx.lineTo(x + lw, ly);
+    ctx.closePath();
+    ctx.fillStyle = shade;
+    ctx.fill();
+    // Highlight edge
+    ctx.beginPath();
+    ctx.moveTo(x, ly - lh);
+    ctx.lineTo(x - lw * 0.4, ly - lh * 0.3);
+    ctx.strokeStyle = 'rgba(120,200,80,0.3)';
+    ctx.lineWidth = 0.8;
+    ctx.stroke();
+  }
+}
+
+// Draw a broad deciduous tree
+function drawBroadTree(x, y, size, rng) {
+  if (x < -30 || x > W+30 || y < -30 || y > H+30) return;
+  // Trunk
+  ctx.fillStyle = '#7a5530';
+  ctx.fillRect(x - size*0.1, y, size*0.2, size*0.6);
+  // Canopy shadow
+  ctx.beginPath();
+  ctx.ellipse(x+3, y - size*0.5 + 3, size*1.1, size*0.85, 0, 0, Math.PI*2);
+  ctx.fillStyle = 'rgba(0,0,0,0.1)';
+  ctx.fill();
+  // Canopy
+  const tg = ctx.createRadialGradient(x - size*0.2, y - size*0.7, size*0.1, x, y - size*0.5, size);
+  tg.addColorStop(0, '#7aba50');
+  tg.addColorStop(0.5, '#4a8a28');
+  tg.addColorStop(1, '#2a5a18');
+  ctx.beginPath();
+  ctx.ellipse(x, y - size*0.5, size, size*0.82, 0, 0, Math.PI*2);
+  ctx.fillStyle = tg;
+  ctx.fill();
+  // Secondary lobe
+  ctx.beginPath();
+  ctx.ellipse(x + size*0.55, y - size*0.4, size*0.55, size*0.5, 0.4, 0, Math.PI*2);
+  ctx.fillStyle = 'rgba(60,120,30,0.45)';
+  ctx.fill();
+}
+
+// Draw a boulder/rock
+function drawRock(x, y, size, rng) {
+  if (x < -20 || x > W+20 || y < -20 || y > H+20) return;
+  ctx.beginPath();
+  ctx.ellipse(x+2, y+2, size*1.15, size*0.75, 0, 0, Math.PI*2);
+  ctx.fillStyle = 'rgba(0,0,0,0.12)';
+  ctx.fill();
+  ctx.beginPath();
+  const ang = rng() * 0.5;
+  ctx.ellipse(x, y, size, size*0.7, ang, 0, Math.PI*2);
+  const rg = ctx.createRadialGradient(x-size*0.3, y-size*0.25, 1, x, y, size);
+  rg.addColorStop(0, '#c8c0b0');
+  rg.addColorStop(0.6, '#9a9080');
+  rg.addColorStop(1, '#6a6058');
+  ctx.fillStyle = rg;
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(80,70,60,0.4)';
+  ctx.lineWidth = 0.7;
+  ctx.stroke();
+}
+
+// Draw grass tufts
+function drawGrass(x, y, size, rng) {
+  if (x < -10 || x > W+10 || y < -10 || y > H+10) return;
+  const blades = 5 + Math.floor(rng() * 4);
+  for (let b = 0; b < blades; b++) {
+    const bx = x + (rng()-0.5)*size*1.4;
+    const lean = (rng()-0.5)*0.7;
+    ctx.beginPath();
+    ctx.moveTo(bx, y);
+    ctx.quadraticCurveTo(bx + lean*size, y - size*0.6, bx + lean*size*1.4, y - size*(0.8+rng()*0.4));
+    ctx.strokeStyle = `rgba(${60+Math.floor(rng()*30)},${110+Math.floor(rng()*40)},${20+Math.floor(rng()*20)},0.8)`;
+    ctx.lineWidth = 1 + rng();
+    ctx.stroke();
+  }
+}
+
+// Draw vegetation circles (trees/shrubs like reference image)
+function drawVegetation() {
+  const rng = mkRng(42);
+
+  // Build bank positions at multiple distances from stream for layered depth
+  const layers = [
+    { step: 4, minOff: 28, maxOff: 50, density: 1.0 },   // close bank
+    { step: 5, minOff: 55, maxOff: 95, density: 0.85 },   // mid
+    { step: 7, minOff: 100, maxOff: 160, density: 0.7 },  // far back
+  ];
+
+  layers.forEach(layer => {
+    for (let s = 0; s < STREAM_SAMPLES.length; s += layer.step) {
+      const samp = STREAM_SAMPLES[s];
+      const norm = getNormal(STREAM_SAMPLES, s);
+      const sw = streamWidthAt(samp.t);
+
+      for (const side of [1, -1]) {
+        if (rng() > layer.density) continue;
+        const off = layer.minOff + rng() * (layer.maxOff - layer.minOff);
+        const jx = (rng()-0.5)*18, jy = (rng()-0.5)*18;
+        const x = samp.pt.x + side * norm.nx * (sw + off) + jx;
+        const y = samp.pt.y + side * norm.ny * (sw + off) + jy;
+
+        const roll = rng();
+        if (off < 55) {
+          // Close bank: grass tufts + small shrubs
+          if (roll < 0.35) {
+            drawGrass(x, y, 8 + rng()*6, rng);
+          } else if (roll < 0.65) {
+            // Small shrub
+            const r2 = 8 + rng()*8;
+            ctx.beginPath();
+            ctx.ellipse(x+2, y+2, r2*1.1, r2*0.75, 0, 0, Math.PI*2);
+            ctx.fillStyle = 'rgba(0,0,0,0.08)'; ctx.fill();
+            const sg = ctx.createRadialGradient(x-2, y-2, 1, x, y, r2);
+            sg.addColorStop(0, '#9ad870'); sg.addColorStop(0.6, '#5a9040'); sg.addColorStop(1, '#3a6820');
+            ctx.beginPath(); ctx.arc(x, y, r2, 0, Math.PI*2); ctx.fillStyle = sg; ctx.fill();
+          } else {
+            drawRock(x, y, 5 + rng()*7, rng);
+          }
+        } else if (off < 95) {
+          // Mid bank: mixed trees + boulders
+          if (roll < 0.4) {
+            drawBroadTree(x, y, 14 + rng()*10, rng);
+          } else if (roll < 0.72) {
+            drawTree(x, y, 10 + rng()*8, rng);
+          } else if (roll < 0.88) {
+            drawRock(x, y, 7 + rng()*9, rng);
+          } else {
+            drawGrass(x, y, 10 + rng()*5, rng);
+          }
+        } else {
+          // Far back: larger trees dominate
+          if (roll < 0.55) {
+            drawBroadTree(x, y, 18 + rng()*14, rng);
+          } else if (roll < 0.85) {
+            drawTree(x, y, 14 + rng()*12, rng);
+          } else {
+            drawRock(x, y, 9 + rng()*11, rng);
+          }
+        }
+      }
+    }
+  });
+}
+
+// Draw the stream (water channel + banks + gravel bars)
+function drawStream() {
+  const N = STREAM_SAMPLES.length;
+
+  // Outer bank (land/gravel color)
+  ctx.beginPath();
+  // Left edge
+  for (let i = 0; i < N; i++) {
+    const s = STREAM_SAMPLES[i];
+    const norm = getNormal(STREAM_SAMPLES, i);
+    const sw = streamWidthAt(s.t) + 22;
+    const x = s.pt.x + norm.nx * sw;
+    const y = s.pt.y + norm.ny * sw;
+    i===0 ? ctx.moveTo(x,y) : ctx.lineTo(x,y);
+  }
+  // Right edge (reverse)
+  for (let i = N-1; i >= 0; i--) {
+    const s = STREAM_SAMPLES[i];
+    const norm = getNormal(STREAM_SAMPLES, i);
+    const sw = streamWidthAt(s.t) + 22;
+    ctx.lineTo(s.pt.x - norm.nx*sw, s.pt.y - norm.ny*sw);
+  }
+  ctx.closePath();
+  ctx.fillStyle = '#d8c89a';
+  ctx.fill();
+
+  // Gravel bar (inner sandy area)
+  ctx.beginPath();
+  for (let i = 0; i < N; i++) {
+    const s = STREAM_SAMPLES[i];
+    const norm = getNormal(STREAM_SAMPLES, i);
+    const sw = streamWidthAt(s.t) + 8;
+    const x = s.pt.x + norm.nx * sw;
+    const y = s.pt.y + norm.ny * sw;
+    i===0 ? ctx.moveTo(x,y) : ctx.lineTo(x,y);
+  }
+  for (let i = N-1; i >= 0; i--) {
+    const s = STREAM_SAMPLES[i];
+    const norm = getNormal(STREAM_SAMPLES, i);
+    const sw = streamWidthAt(s.t) + 8;
+    ctx.lineTo(s.pt.x - norm.nx*sw, s.pt.y - norm.ny*sw);
+  }
+  ctx.closePath();
+  ctx.fillStyle = '#e8d8a8';
+  ctx.fill();
+
+  // Water channel
+  ctx.beginPath();
+  for (let i = 0; i < N; i++) {
+    const s = STREAM_SAMPLES[i];
+    const norm = getNormal(STREAM_SAMPLES, i);
+    const sw = streamWidthAt(s.t);
+    const x = s.pt.x + norm.nx * sw;
+    const y = s.pt.y + norm.ny * sw;
+    i===0 ? ctx.moveTo(x,y) : ctx.lineTo(x,y);
+  }
+  for (let i = N-1; i >= 0; i--) {
+    const s = STREAM_SAMPLES[i];
+    const norm = getNormal(STREAM_SAMPLES, i);
+    const sw = streamWidthAt(s.t);
+    ctx.lineTo(s.pt.x - norm.nx*sw, s.pt.y - norm.ny*sw);
+  }
+  ctx.closePath();
+
+  // Water gradient - blue-green naturalistic
+  const waterG = ctx.createLinearGradient(0,0,W,H);
+  waterG.addColorStop(0, '#aad4e8');
+  waterG.addColorStop(0.4, '#7ab8d0');
+  waterG.addColorStop(1, '#5a9ab8');
+  ctx.fillStyle = waterG;
+  ctx.fill();
+
+  // Water ripple lines
+  ctx.save();
+  ctx.clip();
+  ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+  ctx.lineWidth = 0.7;
+  for (let i = 0; i < N; i += 8) {
+    const s = STREAM_SAMPLES[i];
+    const norm = getNormal(STREAM_SAMPLES, i);
+    const sw = streamWidthAt(s.t) - 6;
+    if (sw < 4) continue;
+    ctx.beginPath();
+    ctx.moveTo(s.pt.x + norm.nx*sw*0.5, s.pt.y + norm.ny*sw*0.5);
+    ctx.lineTo(s.pt.x - norm.nx*sw*0.5, s.pt.y - norm.ny*sw*0.5);
+    ctx.stroke();
+  }
+  ctx.restore();
+
+  // Bank edge lines
+  ctx.beginPath();
+  for (let i = 0; i < N; i++) {
+    const s = STREAM_SAMPLES[i];
+    const norm = getNormal(STREAM_SAMPLES, i);
+    const sw = streamWidthAt(s.t);
+    const x = s.pt.x + norm.nx * sw;
+    const y = s.pt.y + norm.ny * sw;
+    i===0 ? ctx.moveTo(x,y) : ctx.lineTo(x,y);
+  }
+  ctx.strokeStyle = '#7a9a7a';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  ctx.beginPath();
+  for (let i = 0; i < N; i++) {
+    const s = STREAM_SAMPLES[i];
+    const norm = getNormal(STREAM_SAMPLES, i);
+    const sw = streamWidthAt(s.t);
+    i===0 ? ctx.moveTo(s.pt.x - norm.nx*sw, s.pt.y - norm.ny*sw) : ctx.lineTo(s.pt.x - norm.nx*sw, s.pt.y - norm.ny*sw);
+  }
+  ctx.strokeStyle = '#7a9a7a';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  // Flow arrow
+  for (let s = 20; s < N-10; s += 30) {
+    const samp = STREAM_SAMPLES[s];
+    const samp2 = STREAM_SAMPLES[Math.min(s+8, N-1)];
+    const dx = samp2.pt.x - samp.pt.x;
+    const dy = samp2.pt.y - samp.pt.y;
+    const len = Math.sqrt(dx*dx+dy*dy);
+    if (len < 1) continue;
+    const nx2 = dx/len, ny2 = dy/len;
+    const ax = samp.pt.x, ay = samp.pt.y;
+    ctx.beginPath();
+    ctx.moveTo(ax, ay);
+    ctx.lineTo(ax + nx2*12, ay + ny2*12);
+    ctx.strokeStyle = 'rgba(255,255,255,0.45)';
+    ctx.lineWidth = 1.2;
+    ctx.stroke();
+    // arrowhead
+    ctx.beginPath();
+    ctx.moveTo(ax + nx2*12, ay + ny2*12);
+    ctx.lineTo(ax + nx2*8 - ny2*4, ay + ny2*8 + nx2*4);
+    ctx.moveTo(ax + nx2*12, ay + ny2*12);
+    ctx.lineTo(ax + nx2*8 + ny2*4, ay + ny2*8 - nx2*4);
+    ctx.stroke();
+  }
+}
+
+// Convex hull (Graham scan)
+function convexHull(pts) {
+  if (pts.length < 3) return pts.slice();
+  const sorted = pts.slice().sort((a,b) => a.x-b.x || a.y-b.y);
+  const cross = (o,a,b) => (a.x-o.x)*(b.y-o.y)-(a.y-o.y)*(b.x-o.x);
+  const lower = [], upper = [];
+  for (const p of sorted) {
+    while (lower.length >= 2 && cross(lower[lower.length-2], lower[lower.length-1], p) <= 0) lower.pop();
+    lower.push(p);
+  }
+  for (let i = sorted.length-1; i >= 0; i--) {
+    const p = sorted[i];
+    while (upper.length >= 2 && cross(upper[upper.length-2], upper[upper.length-1], p) <= 0) upper.pop();
+    upper.push(p);
+  }
+  upper.pop(); lower.pop();
+  return lower.concat(upper);
+}
+
+// Draw home range hull (convex hull with soft fill)
+function drawHull(pts, color) {
+  if (pts.length < 3) return;
+  const hull = convexHull(pts);
+  if (hull.length < 3) return;
+  ctx.beginPath();
+  ctx.moveTo(hull[0].x, hull[0].y);
+  for (let i = 1; i < hull.length; i++) ctx.lineTo(hull[i].x, hull[i].y);
+  ctx.closePath();
+  const r = parseInt(color.slice(1,3),16), g = parseInt(color.slice(3,5),16), b = parseInt(color.slice(5,7),16);
+  ctx.fillStyle = `rgba(${r},${g},${b},0.12)`;
+  ctx.fill();
+  ctx.strokeStyle = `rgba(${r},${g},${b},0.5)`;
+  ctx.lineWidth = 1.2;
+  ctx.setLineDash([4,3]);
+  ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+// Build minimum spanning tree edges so each point connects to exactly one other
+function buildMST(pts) {
+  // Prim's algorithm
+  if (pts.length < 2) return [];
+  const inTree = new Array(pts.length).fill(false);
+  const edges = [];
+  inTree[0] = true;
+  for (let step = 1; step < pts.length; step++) {
+    let bestDist = Infinity, bestI = -1, bestJ = -1;
+    for (let i = 0; i < pts.length; i++) {
+      if (!inTree[i]) continue;
+      for (let j = 0; j < pts.length; j++) {
+        if (inTree[j]) continue;
+        const d = (pts[i].x-pts[j].x)**2 + (pts[i].y-pts[j].y)**2;
+        if (d < bestDist) { bestDist=d; bestI=i; bestJ=j; }
+      }
+    }
+    if (bestJ === -1) break;
+    inTree[bestJ] = true;
+    edges.push([bestI, bestJ]);
+  }
+  return edges;
+}
+
+// Draw connection lines + points for a cloud
+function drawCloud(pts, fi, isSelected) {
+  if (pts.length === 0) return;
+  const fc = FISH[fi];
+
+  // MST: each point connects to exactly one other
+  const edges = buildMST(pts);
+  edges.forEach(([i, j]) => {
+    const p = pts[i], q = pts[j];
+    ctx.beginPath();
+    ctx.moveTo(p.x, p.y);
+    ctx.lineTo(q.x, q.y);
+    const alpha = isSelected ? 0.55 : 0.35;
+    ctx.strokeStyle = fc.main + Math.round(alpha*255).toString(16).padStart(2,'0');
+    ctx.lineWidth = isSelected ? 1.4 : 1.0;
+    ctx.stroke();
+  });
+
+  // Points
+  pts.forEach((p, idx) => {
+    const r = isSelected ? 5.5 : 4;
+    // Shadow
+    ctx.beginPath();
+    ctx.arc(p.x+1, p.y+1, r, 0, Math.PI*2);
+    ctx.fillStyle = 'rgba(0,0,0,0.2)';
+    ctx.fill();
+    // Fill
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, r, 0, Math.PI*2);
+    ctx.fillStyle = isSelected ? fc.light : fc.main + 'cc';
+    ctx.fill();
+    ctx.strokeStyle = isSelected ? '#fff' : fc.light + '99';
+    ctx.lineWidth = isSelected ? 1.5 : 0.8;
+    ctx.stroke();
+    // Point index for selected
+    if (isSelected) {
+      ctx.fillStyle = 'rgba(0,0,0,0.65)';
+      ctx.font = '8px Georgia';
+      ctx.fillText(idx+1, p.x+6, p.y+3);
+    }
+  });
+
+  // Fish symbol at centroid
+  if (pts.length > 0) {
+    const cx = pts.reduce((s,p) => s+p.x,0)/pts.length;
+    const cy = pts.reduce((s,p) => s+p.y,0)/pts.length;
+    ctx.font = isSelected ? 'bold 11px Georgia' : '10px Georgia';
+    ctx.fillStyle = fc.main;
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 3;
+    ctx.strokeText(fc.name, cx+8, cy-6);
+    ctx.fillText(fc.name, cx+8, cy-6);
+    // Fish icon
+    ctx.font = '16px serif';
+    ctx.fillText('🐟', cx-8, cy+6);
+  }
+}
+
+// Legend box (HTML overlay)
+function drawLegend() {
+  const list = document.getElementById('legend-fish-list');
+  list.innerHTML = FISH.map((f, i) => `
+    <div class="legend-fish${i===selectedFish?' selected':''}">
+      <div class="legend-swatch" style="background:${f.main}"></div>
+      ${f.name}
+    </div>`).join('');
+}
+
+function render() {
+  ctx.clearRect(0,0,W,H);
+  drawBackground();
+  drawVegetation();
+  drawStream();
+
+  // Draw non-selected fish first
+  for (let i = 0; i < 5; i++) {
+    if (i === selectedFish) continue;
+    if (showHull) drawHull(fishClouds[i], FISH[i].main);
+    drawCloud(fishClouds[i], i, false);
+  }
+  // Draw selected on top
+  if (showHull) drawHull(fishClouds[selectedFish], FISH[selectedFish].main);
+  drawCloud(fishClouds[selectedFish], selectedFish, true);
+
+  drawLegend();
+}
+
+// --- Interaction ---
+function getPos(e) {
+  const rect = canvas.getBoundingClientRect();
+  const src = e.touches ? e.touches[0] : e;
+  return {
+    x: (src.clientX - rect.left) * W / rect.width,
+    y: (src.clientY - rect.top) * H / rect.height
+  };
+}
+
+function findNearest(x, y, thresh=12) {
+  let best=null, bd=thresh*thresh;
+  fishClouds.forEach((pts, fi) => {
+    pts.forEach((p, idx) => {
+      const d=(p.x-x)**2+(p.y-y)**2;
+      if(d<bd){bd=d;best={fi,idx};}
+    });
+  });
+  return best;
+}
+
+function handleStart(e) {
+  if (locked) return;
+  if (e.target === document.getElementById('legend') || document.getElementById('legend').contains(e.target)) return;
+  if (e.cancelable) e.preventDefault();
+  const {x,y} = getPos(e);
+  if (mode==='add') {
+    fishClouds[selectedFish].push(clampToStream(x,y));
+    render();
+  } else if (mode==='move') {
+    const f = findNearest(x,y);
+    if (f) { dragging=f; canvas.style.cursor='grabbing'; }
+  } else if (mode==='delete') {
+    const f = findNearest(x,y);
+    if (f) { fishClouds[f.fi].splice(f.idx,1); render(); }
+  }
+}
+function handleMove(e) {
+  if (!dragging) return;
+  if (e.cancelable) e.preventDefault();
+  const {x,y} = getPos(e);
+  fishClouds[dragging.fi][dragging.idx] = clampToStream(x,y);
+  render();
+}
+function handleEnd() {
+  dragging=null;
+  if(mode==='move') canvas.style.cursor='grab';
+}
+canvas.addEventListener('mousedown', handleStart);
+canvas.addEventListener('mousemove', handleMove);
+canvas.addEventListener('mouseup', handleEnd);
+canvas.addEventListener('mouseleave', handleEnd);
+// On mobile: allow page to scroll naturally in add/delete mode (pan-y on canvas).
+// Only block default in move mode while actively dragging a point.
+canvas.addEventListener('touchstart', e => {
+  // Always handle tap for add/delete — these are instantaneous and don't conflict with scroll
+  if (mode === 'add' || mode === 'delete') {
+    handleStart(e);
+  } else if (mode === 'move') {
+    // Check if a point is nearby before claiming the touch
+    const rect = canvas.getBoundingClientRect();
+    const t0 = e.touches[0];
+    const tx = (t0.clientX - rect.left) * W / rect.width;
+    const ty = (t0.clientY - rect.top) * H / rect.height;
+    const f = findNearest(tx, ty);
+    if (f) {
+      if (e.cancelable) e.preventDefault();
+      handleStart(e);
+    }
+    // else: no point nearby → let scroll happen
+  }
+}, {passive: false});
+canvas.addEventListener('touchmove', e => {
+  if (dragging) {
+    if (e.cancelable) e.preventDefault();
+    handleMove(e);
+  }
+  // else: no active drag → let default scroll happen
+}, {passive: false});
+canvas.addEventListener('touchend', handleEnd);
+canvas.addEventListener('touchcancel', handleEnd);
+
+function exportData() {
+  const out = {};
+  fishClouds.forEach((pts,i) => { out[FISH[i].name] = pts; });
+  const blob = new Blob([JSON.stringify(out,null,2)], {type:'application/json'});
+  const a = document.createElement('a');
+  a.href=URL.createObjectURL(blob); a.download='trout_homeranges.json'; a.click();
+}
+
+render();
+
+// --- Draggable legend (mouse + touch) ---
+(function() {
+  const leg = document.getElementById('legend');
+  let ox=0, oy=0, lx=0, ly=0, down=false;
+
+  function startDrag(cx, cy) {
+    down = true;
+    ox = cx; oy = cy;
+    const style = window.getComputedStyle(leg);
+    lx = parseInt(style.left)||0; ly = parseInt(style.top)||0;
+  }
+  function moveDrag(cx, cy) {
+    if (!down) return;
+    const dx = cx - ox, dy = cy - oy;
+    const wrapper = document.getElementById('canvas-wrapper');
+    const maxX = wrapper.offsetWidth - leg.offsetWidth;
+    const maxY = wrapper.offsetHeight - leg.offsetHeight;
+    leg.style.left = Math.max(0, Math.min(lx+dx, maxX)) + 'px';
+    leg.style.top  = Math.max(0, Math.min(ly+dy, maxY)) + 'px';
+  }
+
+  leg.addEventListener('mousedown', e => { startDrag(e.clientX, e.clientY); e.preventDefault(); e.stopPropagation(); });
+  document.addEventListener('mousemove', e => moveDrag(e.clientX, e.clientY));
+  document.addEventListener('mouseup', () => { down = false; });
+
+  leg.addEventListener('touchstart', e => {
+    const t = e.touches[0];
+    startDrag(t.clientX, t.clientY);
+    e.preventDefault(); e.stopPropagation();
+  }, {passive: false});
+  document.addEventListener('touchmove', e => {
+    if (!down) return;
+    const t = e.touches[0];
+    moveDrag(t.clientX, t.clientY);
+    e.preventDefault();
+  }, {passive: false});
+  document.addEventListener('touchend', () => { down = false; });
+})();
+</script>
+</body>
+</html>
