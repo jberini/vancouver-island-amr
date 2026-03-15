@@ -1,0 +1,688 @@
+---
+title: "AMR_RF_Hypothesis_Models"
+author: "John Berini"
+date: "2026-02-21"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+bring in our data and load the packages
+```{r setup}
+#packages
+library(caret)
+library(dplyr)#top_n
+library(tidyverse)#rownames_to_column
+library(Hmisc) #rcorr
+library(car)#vif function
+library(sp)
+library(sf)
+library(gstat)
+library(ggplot2)
+
+
+amr<-read.csv("data/AMR_2024.12.09.csv", header=T) #need to create a file that keeps the number of lakes at 39 and does not reduce. 
+
+covs<-read.csv("data/rf_dat.csv", header=T) #create a new covs file that has all 39 lakes found in the amr dataframe
+
+vi_vect<-st_read("/Volumes/jberini_SSD/spat_dat/gis/acoustic monitor locations/vi_outline.shp")
+#vi<-st_read("gis/vi_outline.shp")
+
+#regression kriging only works with continuous data, so we will remove those covariates that are non continuous
+covs <- covs[, !names(covs) %in% c("cov_patt", "crwn_clsre")] #these are ordinal
+
+```
+
+subset data to include only those covariates that we are interested in:
+watershed
+underlying bed rock
+land-use variables
+  - % forest Loss
+  - distance fo nearest road
+  - distance to aquaculture
+Environmental Covariates
+  - air temperature (mean?)
+  - lake depth (fetch size) - lakemorpho package
+Distance to nearest lake
+  - some way to include slope/topography
+  - 
+```{r}
+covs_subset <- covs[, c(
+  "lake_name",
+  "lake_code",
+  "latitude",
+  "longitude",
+  "watershed",
+  "bedrock",
+  "mean_TREE_COVER",
+  "mean_SOIL_NUTRI",
+  "mean_d2_paved",
+  "mean_d2_ogdc",
+  "mean_rd_dnse_loose",
+  "mean_rd_dnse_ogdc",
+  "mean_rd_dnse_paved",
+  "d2_aquaculture",
+  "mean_Tmax_sm",
+  "max_depth_est",
+  "mean_d2_lake",
+  "mean_DEM_vi",
+  "mean_Band_1",
+  "mean_spp1_pc",
+  "mean_NFFD09",
+  "mean_spp2_pc",
+  "mean_basal_area",
+  "mean_SPECIES__3"
+)]
+
+```
+
+```{r}
+lamr<-amr
+colnames(lamr)[which(names(lamr) == "Lake")] <- "lake_code"
+
+var_list<-names(lamr) %in% c("Samples", "lake_code", "Lake_AMR", "co_occur")
+lamr<-lamr[var_list]
+```
+
+aggregate data to get the means and remove those that have ZEROS remaining
+
+```{r}
+#aggregate the data based on lake code
+lamr_agg<-as.data.frame(aggregate(lamr$Lake_AMR, list(lamr$lake_code), FUN=mean))
+
+#rename columns
+names(lamr_agg)<-c("lake_code", "lake_amr")
+
+#remove the zeroes
+lamr_agg<-lamr_agg[lamr_agg$lake_amr>0,] #remove lake_amr values equal to 0
+lamr_agg <- lamr_agg[complete.cases(lamr_agg), ] #remove NAs
+
+```
+
+now we merge the datasets
+
+```{r}
+#merge
+lamr_merge<-merge(x = lamr_agg, y = covs_subset, by = "lake_code")
+
+#remove columns from merged data frame that are not useful. 
+lake_code<-lamr_merge$lake_code
+lake_name<-lamr_merge$lake_name
+longitude<-lamr_merge$longitude
+latitude<-lamr_merge$latitude
+lake_amr<-lamr_merge$lake_amr
+
+#subset lamr_merge to remove those columns not wanted or needed in random forest and model selection
+lamr_merge <- lamr_merge[, -which(names(lamr_merge) %in% c("lake_code", "X", "lake_name", "lake_name.1", "latitude", "longitude"))]
+
+lamr_rf_dat<-lamr_merge
+```
+
+subset lamr_rf_dat
+
+```{r}
+lamr_subset <- lamr_rf_dat[, c(
+  "watershed",
+  "bedrock",
+  "mean_TREE_COVER",
+  "mean_SOIL_NUTRI",
+  "mean_d2_paved",
+  "mean_d2_ogdc",
+  "mean_rd_dnse_loose",
+  "mean_rd_dnse_ogdc",
+  "mean_rd_dnse_paved",
+  "d2_aquaculture",
+  "mean_Tmax_sm",
+  "max_depth_est",
+  "mean_d2_lake",
+  "mean_DEM_vi",
+  "mean_Band_1",
+  "mean_spp1_pc",
+  "mean_NFFD09",
+  "mean_spp2_pc",
+  "mean_basal_area",
+  "mean_SPECIES__3"
+)]
+
+
+lamr_subset$lake_code<-lake_code
+lamr_subset$latitude<-latitude
+lamr_subset$longitude<-longitude
+lamr_subset$lake_amr<-lake_amr
+
+```
+
+
+perform model selection
+```{r}
+library(lmerTest)
+# 1. Define your candidate column names
+candidates <- c(  "mean_d2_paved",
+                  "mean_d2_ogdc",
+                  "mean_rd_dnse_loose",
+                  "mean_rd_dnse_ogdc",
+                  "mean_rd_dnse_paved",
+                  "d2_aquaculture",
+                  "mean_Tmax_sm",
+                  "mean_d2_lake",
+                  "mean_SOIL_NUTRI",
+                  "mean_TREE_COVER",
+                  "mean_Band_1",
+                  "mean_spp1_pc",
+                  "bedrock",
+                  "mean_spp2_pc",
+                  "mean_NFFD09",
+                  "max_depth_est",
+                  "mean_DEM_vi", 
+                  "mean_basal_area",
+                  "mean_SPECIES__3"
+)
+
+# 2. Setup results table
+results <- data.frame(Variable = character(), 
+                      P_Value = numeric(), 
+                      Estimate = numeric(), 
+                      Warnings = character(),
+                      stringsAsFactors = FALSE)
+
+# 3. The Fixed Loop
+for (col_name in candidates) {
+  
+  # Construct the formula string safely
+  form_str <- paste0("lake_amr ~ scale(", col_name, ") + (1 | bedrock)")
+  form <- as.formula(form_str)
+  
+  # Run the model
+  # tryCatch allows us to capture warnings like "singular fit"
+  try({
+    m <- lmer(form, data = lamr_subset)
+    
+    # Check for singular fit (common with small n)
+    is_singular <- isSingular(m)
+    
+    # Extract stats
+    # Fixed effects table: Row 1 is Intercept, Row 2 is your variable
+    summ <- summary(m)$coefficients
+    p_val <- summ[2, "Pr(>|t|)"]
+    est <- summ[2, "Estimate"]
+    
+    # Save results
+    results <- rbind(results, data.frame(
+      Variable = col_name, 
+      P_Value = p_val, 
+      Estimate = est,
+      Warnings = if(is_singular) "Singular Fit" else "None"
+    ))
+  }, silent = TRUE)
+}
+
+# 4. View your "Shortlist"
+results <- results[order(results$P_Value), ]
+print(results)
+
+
+# 1. Define the Null Model (No predictors, just the random effect)
+null_model <- lmer(lake_amr ~ (1 | bedrock), data = lamr_subset, REML = FALSE)
+
+# 2. Re-run your Full Model with REML = FALSE 
+# (Required for comparing models with different fixed effects)
+model1 <- lmer(lake_amr ~ scale(mean_d2_lake) + 
+                         scale(mean_SPECIES__3) + 
+                         scale(d2_aquaculture) +
+                         scale(mean_Band_1) + #distance to old growth forest
+                         (1|bedrock),
+              data = lamr_subset)
+summary(model1)
+
+anova(null_model, model1)
+
+```
+
+Use best fitting model in a mixed-effets regression kriging format. 
+
+Now that we have our best fitting model,we can begin the process of regression kriging.
+
+First we'll install some packages. 
+
+```{r}
+library(gstat)
+library(terra)
+library(sp)
+library(sf)
+library(raster)
+```
+
+Now we need to read in our spatial data, based in our best fitting model. 
+
+```{r}
+#best fitting model based on ranger and step functions
+summary(model1)
+
+#make sure to attached the courses drive @ Carleton
+#landscape covariates
+d2_lake<-rast("/Volumes/COURSES/biol394-13-f23/StuWork/johnsonk4/raster/wgs84UTMz10/tiff/d2_lake.tif")
+#d2_lake<-rast("tiff/d2_lake.tif")
+
+d2_ancient<-rast("/Volumes/COURSES/biol394-13-f23/StuWork/johnsonk4/raster/wgs84UTMz10/tiff/d2_ancient.tif")
+#d2_ancient<-rast("/tiff/d2_ancient.tif")
+
+spp3_cvr<-rast("/Volumes/COURSES/biol394-13-f23/StuWork/johnsonk4/raster/wgs84UTMz10/tiff/spp3_cvr.tif")
+#spp3_cvr<-rast("tiff/spp3_cvr.tif")
+
+#distance to aquaculture
+d2_aqua<-rast("data/d2_aquaculture.tif")
+
+#watershed
+bedrock<-st_read("../../gis/BC_digital_geology_shp/BC_bedrock_ll83.shp")
+# fix invalid polygons
+bedrock <- st_make_valid(bedrock)
+# remove any empty geometries created by st_make_valid
+bedrock <- bedrock[!st_is_empty(bedrock), ]
+
+
+```
+
+check the raster coordinate systems and make sure they are all the same extent and resolution
+
+```{r}
+#coordinate systems
+crs(d2_lake)
+crs(d2_ancient)
+crs(spp3_cvr)
+crs(d2_aqua)
+crs(bedrock)
+
+st_crs(bedrock)
+st_crs(vi_vect)
+
+#check resolution and resample if necessary. Resampling to the coarsest raster to save time/computational resources
+res(d2_lake)
+
+res(d2_ancient)
+d2_ancient <- resample(d2_ancient, d2_lake, method = "bilinear")
+
+res(spp3_cvr)
+spp3_cvr <- resample(spp3_cvr, d2_lake, method = "bilinear")
+
+res(d2_aqua)
+d2_aqua <- resample(d2_aqua, d2_lake, method = "bilinear")
+
+# Now crop to Vancouver Island
+spp3_cvr   <- crop(spp3_cvr, vi_vect)
+d2_lake    <- crop(d2_lake, vi_vect)
+d2_ancient <- crop(d2_ancient, vi_vect)
+d2_aqua    <- crop(d2_aqua, vi_vect)
+
+# Final alignment step (guarantees identical grids)
+d2_ancient <- resample(d2_ancient, d2_lake)
+spp3_cvr   <- resample(spp3_cvr, d2_lake)
+d2_aqua    <- resample(d2_aqua, d2_lake)
+
+#now we just need to check our extents
+ext(d2_lake)
+ext(d2_ancient)
+ext(spp3_cvr)
+ext(d2_aqua)
+ext(bedrock)
+
+#check names - if incorrect, assign appropriate name
+names(d2_lake)
+names(d2_ancient)
+# Rename it
+names(d2_ancient) <- "d2_ancient"
+
+names(spp3_cvr)
+# Rename it
+names(spp3_cvr) <- "spp3_cvr"
+
+
+names(d2_aqua)
+# Rename it
+names(d2_aqua) <- "d2_aqua"
+
+#check names in lamr_subset
+names(lamr_subset)
+
+#rename data
+names(lamr_subset)[names(lamr_subset) == "mean_d2_lake"] <- "d2_lake"
+names(lamr_subset)[names(lamr_subset) == "mean_Band_1"] <- "d2_ancient"
+names(lamr_subset)[names(lamr_subset) == "mean_SPECIES__3"] <- "spp3_cvr"
+names(lamr_subset)[names(lamr_subset) == "d2_aquaculture"] <- "d2_aqua"
+
+```
+
+Calculate residuals and compute a variogram
+
+```{r}
+#estimate our residuals for our best fitting model
+lamr_subset$residuals<-residuals(model1)
+
+# Create a SpatialPointsDataFrame from rf_dat
+coordinates(lamr_subset) <- ~longitude + latitude
+
+# Assign the CRS from your raster (converted to PROJ.4 format)
+proj4string(lamr_subset) <- crs(d2_lake, proj = TRUE)
+
+
+#====================================================
+
+
+#subset rf_dat to contain only important_covariates
+rf_dat <- lamr_subset[, c("d2_lake", 
+                          "d2_ancient", 
+                          "spp3_cvr", 
+                          "d2_aqua", 
+                          "bedrock", 
+                          "residuals")]
+
+# Create experimental variogram of residuals
+vgram <- variogram(residuals ~ 1, rf_dat)
+
+#define good starting values
+initial_model <- vgm(
+  psill = var(rf_dat$residuals) / 2,
+  model = "Sph",
+  range = max(vgram$dist) / 3,
+  nugget = var(rf_dat$residuals) / 4
+)
+
+# Fit variogram model
+vgram_model <- fit.variogram(vgram, initial_model)
+
+plot(vgram, vgram_model)
+
+#compare multiple model types
+models <- c("Sph","Exp","Gau","Mat")
+
+fits <- lapply(models, function(m) {
+  fit.variogram(vgram,
+                vgm(psill = var(rf_dat$residuals)/2,
+                    model = m,
+                    range = max(vgram$dist)/3,
+                    nugget = var(rf_dat$residuals)/4))
+})
+
+names(fits) <- models
+fits 
+
+#store the best, fitted variogram - Sph
+library(gstat)
+
+# Fit spherical variogram with your chosen parameters
+vgram_model <- fit.variogram(vgram, model = vgm(psill = 0.161, model = "Sph", range = 8.857, nugget = 0.798))
+plot(vgram, vgram_model)
+```
+
+Now that we have a variogram, we can begin building the regression kriging process
+
+```{r}
+# 1. stack the predictors into a single raster stack
+d2_aqua    <- project(d2_aqua, d2_lake)
+
+predictors <- rast(list(d2_lake, d2_ancient, spp3_cvr, d2_aqua))
+names(predictors) <- c("d2_lake", "d2_ancient", "spp3_cvr", "d2_aqua")
+
+# 2. create my model object
+library(lme4)
+
+# 3. convert spatial data to a regular data frame
+lamr_df <- as.data.frame(lamr_subset)
+
+# If you want coordinates as columns (optional)
+lamr_df$lon <- coordinates(lamr_subset)[,1]
+lamr_df$lat <- coordinates(lamr_subset)[,2]
+
+# 4. Create a mixed-effects model object with watershed as random effect
+model <- lmer(lake_amr ~ d2_lake + d2_ancient + spp3_cvr + d2_aqua + (1 | bedrock), REML = TRUE,
+              data = lamr_df)
+summary(model)
+
+# 5. Create a spatial object for the residuals
+res_sf <- st_as_sf(lamr_subset)
+
+# 6. Predict fixed effects over the raster grid
+#convert layers to numeric
+predictors$d2_lake    <- as.numeric(predictors$d2_lake)
+predictors$d2_ancient <- as.numeric(predictors$d2_ancient)
+predictors$spp3_cvr   <- as.numeric(predictors$spp3_cvr)
+predictors$d2_aqua    <- as.numeric(predictors$d2_aqua)
+
+pred_df <- as.data.frame(predictors, xy = TRUE, NA.RM=TRUE)
+pred_df$pred_fixed <- predict(model, newdata = pred_df, re.form = NA)  
+# re.form = NA ensures only fixed effects are used in the prediction
+
+# 7. Convert to SpatialPointsDataFrame for kriging residuals
+coordinates(pred_df) <- ~ x + y
+
+# 8. create my spatial data
+coordinates(lamr_df) <- ~ lon + lat
+proj4string(lamr_df) <- CRS("+proj=longlat +datum=WGS84")
+#If not already set, do the following:
+#coordinates(pred_df) <- ~ x + y  # x and y come from raster grid
+proj4string(pred_df) <- CRS("+proj=longlat +datum=WGS84")
+
+# 9. Krige residuals
+res_krige <- krige(residuals ~ 1, lamr_df, pred_df, model = vgram_model)
+
+# 10. combine residual kriging with mixed model predictions
+# predict fixed effects at the same grid (without random effects)
+pred_df$pred_fixed <- predict(model, newdata = as.data.frame(pred_df), re.form = NA)
+
+# add kriged residuals
+pred_df$rk_pred <- pred_df$pred_fixed + res_krige$var1.pred
+```
+
+Now that we have the final model predictions and the residuals kriged, we can rasterize our points and export to a geotiff. 
+```{r}
+# 1. Get min/max coordinates
+xmin <- min(pred_df$x)
+xmax <- max(pred_df$x)
+ymin <- min(pred_df$y)
+ymax <- max(pred_df$y)
+
+# 2. Decide resolution
+res_xy <- 0.01  # e.g., 0.01 degrees, adjust as needed
+
+# 3. Compute number of rows and columns
+ncol <- ceiling((xmax - xmin) / res_xy)
+nrow <- ceiling((ymax - ymin) / res_xy)
+
+# 4. Create raster template
+r_template <- rast(nrows = nrow, ncols = ncol,
+                   xmin = xmin, xmax = xmax,
+                   ymin = ymin, ymax = ymax,
+                   crs = "+proj=longlat +datum=WGS84 +no_defs")  # string CRS
+
+
+# 5. rasterize
+# Convert SpatialPointsDataFrame to SpatVector
+pred_vect <- vect(pred_df)  # terra-friendly
+
+# Then rasterize
+AMR_reg_krige <- rasterize(pred_vect, r_template, field = "rk_pred")
+
+# 6. Plot to make sure I get the variation I expect
+library(RColorBrewer)
+
+# Create a warm-to-cool palette: red = high, blue = low
+pal <- colorRampPalette(c("lightblue", "dodgerblue", "orange", "red", "red4"))(100)
+
+plot(AMR_reg_krige, main="AMR Predictions", col=pal)
+plot(AMR_reg_krige, main="AMR Predictions", col=viridis::viridis(50))
+
+# 6. Export as a GeoTIFF
+writeRaster(AMR_reg_krige, "R_out/Htest_AMR_reg_krige.tif", overwrite = TRUE)
+
+```
+
+Spatial LOOCV
+
+```{r}
+###############################################################################
+# Spatial Leave-One-Out Cross Validation for Regression Kriging
+###############################################################################
+
+library(gstat)
+library(lme4)
+library(sp)
+
+# 1. Create the dataframe
+lamr_df <- as.data.frame(lamr_subset)
+
+# Ensure the coordinates are numeric
+lamr_df$lon <- as.numeric(lamr_df$longitude)
+lamr_df$lat <- as.numeric(lamr_df$latitude)
+lamr_df$lake_amr <- lake_amr
+
+# 2. PRE-SCALE variables safely
+# Note: I am using the 'mean_' prefix names from your earlier subsetting
+# If you renamed them to d2_lake etc. already, use those names instead.
+lamr_df$d2_lake_s    <- as.numeric(lamr_df$d2_lake)
+lamr_df$d2_ancient_s <- as.numeric(lamr_df$d2_ancient)
+lamr_df$spp3_cvr_s   <- as.numeric(lamr_df$spp3_cvr)
+lamr_df$d2_aqua_s    <- as.numeric(lamr_df$d2_aqua)
+
+n_points <- nrow(lamr_df)
+predictions <- numeric(n_points)
+
+# Define Global FIXED Variogram Model
+fixed_v_model <- vgm(psill = 0.161, model = "Sph", range = 8.857, nugget = 0.798)
+
+for(i in 1:n_points){
+
+  cat("Processing lake", i, "of", n_points, "\n")
+
+  # Split data into training and testing frames
+  train_df <- lamr_df[-i, ]
+  test_df  <- lamr_df[i, ]
+
+  # Create spatial training object for Kriging residuals
+  train_sp <- train_df
+  coordinates(train_sp) <- ~ lon + lat
+  proj4string(train_sp) <- CRS("+proj=longlat +datum=WGS84")
+
+  # 3. Fit regression model
+  model_cv <- lmer(
+    lake_amr ~ d2_lake_s + d2_ancient_s + 
+               spp3_cvr_s + d2_aqua_s + (1 | bedrock),
+    data = train_df
+  )
+
+  # 4. Calculate residuals
+  train_sp$resid <- residuals(model_cv)
+
+  # 5. Krige residual to the single test point
+  # Create a spatial point for the test lake
+  test_sp <- test_df
+  coordinates(test_sp) <- ~ lon + lat
+  proj4string(test_sp) <- CRS("+proj=longlat +datum=WGS84")
+  
+  kr <- krige(resid ~ 1, train_sp, test_sp, model = fixed_v_model)
+
+  # 6. Predict fixed effects for the test point
+  reg_pred <- predict(model_cv, newdata = test_df, re.form = NA)
+
+  # 7. Combine
+  predictions[i] <- reg_pred + kr$var1.pred
+}
+
+###############################################################################
+# Evaluate model
+###############################################################################
+observed <- lamr_df$lake_amr
+rmse <- sqrt(mean((predictions - observed)^2))
+r2   <- cor(predictions, observed)^2
+correlation <- cor(predictions, observed)
+
+cat("LOOCV RMSE:", rmse, "\n")
+cat("LOOCV R²:", r2, "\n")
+cat("LOOCV correlation:", correlation, "\n")
+
+lamr_df$LOOCV_pred <- predictions
+```
+
+Now we can make some diagnostic plots to show how well (or not) out model is working. 
+
+```{r}
+library(patchwork)
+
+# --- Create the plot_df for Diagnostics ---
+plot_df <- data.frame(
+  observed = observed,
+  predicted = predictions,
+  residuals = observed - predictions,
+  x = lamr_df$lon,
+  y = lamr_df$lat
+)
+
+# Define your color scale (required for the p1, p2, p4 plots)
+# This creates a consistent blue-to-red scale centered at 0
+my_color_scale <- scale_color_gradient2(
+  low = "blue", 
+  mid = "white", 
+  high = "red", 
+  midpoint = 0, 
+  name = "Residual"
+)
+
+# Make sure your Vancouver Island outline is ready for Panel D
+# In your setup it was vi_vect, but Panel D calls vi_sf
+vi_sf <- st_as_sf(vi_vect)
+
+# Define a "Publication Theme" to keep everything consistent
+# base_size = 14 or 16 is best for multi-panel figures
+pub_theme <- theme_minimal(base_size = 15) + 
+  theme(
+    plot.title = element_text(size = 20, face = "bold"), # Bigger a, b, c, d
+    axis.title = element_text(size = 16),
+    legend.title = element_text(size = 14),
+    legend.text = element_text(size = 12)
+  )
+
+# --- Panel A ---
+# --- Panel A (Corrected) ---
+p1 <- ggplot(plot_df, aes(x = observed, y = predicted, color = residuals)) +
+  geom_point(alpha = 1, size = 3) + 
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed", linewidth = 1.2) +
+  my_color_scale +
+  labs(x = "Observed AMR", y = "Predicted AMR", title = "a)") +
+  pub_theme +
+  # Use 'predictions' (the vector) instead of 'predicted' (the column name)
+  annotate("text", x = min(observed) + 0.1, y = max(predictions),
+           label = paste0("RMSE = ", round(rmse,2), "\nR = ", round(correlation,2)),
+           hjust = 0, vjust = 2, size = 5.5)
+
+# --- Panel B ---
+p2 <- ggplot(plot_df, aes(x = predicted, y = residuals, color = residuals)) +
+  geom_point(alpha = 1, size = 3) + 
+  geom_hline(yintercept = 0, color = "red", linetype = "dashed", linewidth = 1) +
+  my_color_scale +
+  labs(x = "Predicted lake_amr", y = "Residuals", title = "b)") +
+  pub_theme
+
+# --- Panel C ---
+p3 <- ggplot(plot_df, aes(x = residuals)) +
+  geom_histogram(bins = 15, fill = "gray80", color = "black") + 
+  geom_vline(xintercept = mean(residuals, na.rm = TRUE), color = "red", 
+             linetype = "dashed", linewidth = 1.1) +
+  labs(x = "Residuals", y = "Count", title = "c)") +
+  pub_theme
+
+# --- Panel D ---
+p4 <- ggplot() +
+  geom_sf(data = vi_sf, fill = NA, color = "black", linewidth = 0.6) +
+  geom_point(data = plot_df, aes(x = x, y = y, color = residuals), size = 3.5) +
+  my_color_scale +
+  labs(title = "d)") +
+  pub_theme +
+  coord_sf()
+
+# --- Final Assembly ---
+final_plot <- (p1 + p2) / (p3 + p4) + 
+  plot_layout(guides = "collect") & 
+  theme(legend.position = "right")
+
+# Note: ggsave is best for keeping text crisp in publications
+ggsave("Final Models/LOOCV_Publication_Final.png", final_plot, width = 12, height = 10, dpi = 600)
+```
+
